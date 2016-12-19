@@ -24,6 +24,8 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <pthread.h>
+#include "uECC.h"
 
 #ifdef _WIN32
 #define UART_PORT_NAME "COM1"
@@ -55,7 +57,7 @@ enum
 #define SLAVE_LATENCY                    0                                              /**< Determines slave latency in counts of connection events. */
 #define SUPERVISION_TIMEOUT              MSEC_TO_UNITS(4000, UNIT_10_MS)                /**< Determines supervision time-out in units of 10 millisecond. */
 
-#define TARGET_DEV_NAME                  "Nordic_HRM"                                      /**< Target device name that application is looking for. */
+#define TARGET_DEV_NAME                  "NordicLESCApp"                                      /**< Target device name that application is looking for. */
 #define MAX_PEER_COUNT                   1                                              /**< Maximum number of peer's application intends to manage. */
 
 #define HRM_SERVICE_UUID                 0x180D
@@ -144,9 +146,85 @@ static void status_handler(adapter_t *adapter, sd_rpc_app_status_t code, const c
     printf("Status: %d, message: %s\n", (uint32_t)code, message);
 }
 
+typedef struct
+{
+  uint8_t   sk[32];        /**< LE Secure Connections Elliptic Curve Diffie-Hellman P-256 Private Key in little-endian. */
+} ble_gap_lesc_p256_sk_t;
+
+static ble_gap_lesc_p256_sk_t m_lesc_sk;
+static ble_gap_lesc_p256_pk_t m_lesc_pk;
+static ble_gap_lesc_p256_pk_t m_lesc_peer_pk;
+static ble_gap_lesc_dhkey_t m_lesc_dhkey;
+
+static void authenticate_lesc(){
+    ble_gap_sec_params_t sec_params;
+    memset(&sec_params, 0, sizeof(sec_params));
+
+    sec_params.bond           = 0;
+    sec_params.mitm           = 0;
+    sec_params.lesc           = 1;
+    sec_params.keypress       = 0;
+    sec_params.io_caps        = BLE_GAP_IO_CAPS_NONE;
+    sec_params.oob            = 0;
+    sec_params.min_key_size   = 7;
+    sec_params.max_key_size   = 16;
+    sec_params.kdist_own.enc  = 0;
+    sec_params.kdist_own.id   = 0;
+    sec_params.kdist_peer.enc = 0;
+    sec_params.kdist_peer.id  = 0;
+
+    sd_ble_gap_authenticate(m_adapter, m_connection_handle, &sec_params);
+}
+
+void *sec_params_reply(void * params){
+    const struct uECC_Curve_t * p_curve;
+    uint8_t sec_status = BLE_GAP_SEC_STATUS_SUCCESS;
+
+    ble_gap_sec_keyset_t sec_keyset;
+    memset(&sec_keyset, 0, sizeof(sec_keyset));
+
+    ble_gap_lesc_p256_pk_t peer_pk;
+    memset(&peer_pk, 0, sizeof(peer_pk));
+
+    p_curve = uECC_secp256r1();
+    uECC_make_key(m_lesc_pk.pk, m_lesc_sk.sk, p_curve);
+
+    sec_keyset.keys_own.p_pk = &m_lesc_pk;
+    sec_keyset.keys_own.p_enc_key = NULL;
+    sec_keyset.keys_own.p_id_key = NULL;
+    sec_keyset.keys_own.p_sign_key = NULL;
+
+    sec_keyset.keys_peer.p_pk = &peer_pk;
+    sec_keyset.keys_peer.p_enc_key = NULL;
+    sec_keyset.keys_peer.p_id_key = NULL;
+    sec_keyset.keys_peer.p_sign_key = NULL;
+
+    sd_ble_gap_sec_params_reply(m_adapter, m_connection_handle, 0, NULL, &sec_keyset);
+    return NULL;
+}
+
+void *lesc_dhkey_reply(void * params){
+    sd_ble_gap_lesc_dhkey_reply(m_adapter, m_connection_handle, &m_lesc_dhkey);
+    return NULL;
+}
+
+static void on_gap_evt_sec_params_request(const ble_gap_evt_t * const p_ble_gap_evt){
+    pthread_t *p0;
+    pthread_create(p0, NULL, sec_params_reply, NULL);
+}
+
+static void on_gap_evt_lesc_dhkey_request(const ble_gap_evt_t * const p_ble_gap_evt){
+    m_lesc_peer_pk = *p_ble_gap_evt->params.lesc_dhkey_request.p_pk_peer;
+    const struct uECC_Curve_t * p_curve = uECC_secp256r1();
+    uECC_shared_secret(m_lesc_peer_pk.pk, m_lesc_sk.sk, m_lesc_dhkey.key, p_curve);
+    pthread_t *p0;
+    pthread_create(p0, NULL, lesc_dhkey_reply, NULL);
+}
+
 static void on_connected(const ble_gap_evt_t * const p_ble_gap_evt)
 {
     printf("Connection established\n"); fflush(stdout);
+    sd_ble_gap_scan_stop(m_adapter);
     m_connected_devices++;
     m_connection_handle = p_ble_gap_evt->conn_handle;
     m_connection_is_in_progress = false;
@@ -154,6 +232,7 @@ static void on_connected(const ble_gap_evt_t * const p_ble_gap_evt)
     sd_ble_gattc_exchange_mtu_request(m_adapter, p_ble_gap_evt->conn_handle, 158);
 #endif
     service_discovery_start();
+    authenticate_lesc();
 }
 
 static void on_adv_report(const ble_gap_evt_t * const p_ble_gap_evt)
@@ -638,6 +717,26 @@ static void ble_evt_dispatch(adapter_t * adapter, ble_evt_t * p_ble_evt)
 
     case BLE_GAP_EVT_CONN_PARAM_UPDATE_REQUEST:
         on_conn_params_update_request(&(p_ble_evt->evt.gap_evt));
+        break;
+
+    case BLE_GAP_EVT_SEC_PARAMS_REQUEST:
+        on_gap_evt_sec_params_request(&(p_ble_evt->evt.gap_evt));
+        break;
+
+    case BLE_GAP_EVT_LESC_DHKEY_REQUEST:
+        on_gap_evt_lesc_dhkey_request(&(p_ble_evt->evt.gap_evt));
+        break;
+
+    case BLE_GAP_EVT_AUTH_STATUS:
+         printf("BLE_GAP_EVT_AUTH_STATUS: status=0x%x bond=0x%x lv4: %d lv2: %d\n",
+              p_ble_evt->evt.gap_evt.params.auth_status.auth_status,
+              p_ble_evt->evt.gap_evt.params.auth_status.bonded,
+              p_ble_evt->evt.gap_evt.params.auth_status.sm1_levels.lv4,
+              p_ble_evt->evt.gap_evt.params.auth_status.sm1_levels.lv2);
+        break;
+
+    case BLE_GAP_EVT_CONN_SEC_UPDATE:
+        printf("Recieved conn_sec_update event\n");
         break;
 
 #if NRF_SD_BLE_API >= 3

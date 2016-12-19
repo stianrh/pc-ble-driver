@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.3)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Use multithreaded Boost libraries
 set(Boost_USE_MULTITHREADED ON)
@@ -18,6 +19,7 @@ link_directories (
 include_directories (
     ../../include/common/sdk_compat
     ../../include/common
+    ../../include/common/ecc/micro-ecc
     ../../include/common/internal/transport
 )
 
@@ -28,12 +30,30 @@ endif()
 # Build executable
 add_executable(hrc_v2 main.c)
 add_executable(hrc_v3 main.c)
+add_library(uecc ../../include/common/ecc/micro-ecc/uECC.c)
+
+add_definitions(
+    -DuECC_ENABLE_VLI_API
+    -DuECC_VLI_NATIVE_LITTLE_ENDIAN=1
+    -DuECC_SQUARE_FUNC=1
+    -DuECC_SUPPORTS_secp256r1=1
+    -DuECC_SUPPORT_COMPRESSED_POINT=0
+    -DuECC_OPTIMIZATION_LEVEL=3
+)
 
 target_compile_definitions(hrc_v2 PRIVATE -DNRF_SD_BLE_API=2)
 target_compile_definitions(hrc_v3 PRIVATE -DNRF_SD_BLE_API=3)
 
 target_include_directories(hrc_v2 PRIVATE ../../src/sd_api_v2/sdk/components/softdevice/s132/headers)
 target_include_directories(hrc_v3 PRIVATE ../../src/sd_api_v3/sdk/components/softdevice/s132/headers)
+
+target_include_directories(hrc_v2 PRIVATE ../../src/sd_api_v2/sdk/components/libraries/util)
+target_include_directories(hrc_v3 PRIVATE ../../src/sd_api_v3/sdk/components/libraries/util)
+
+target_include_directories(hrc_v2 PRIVATE ../../src/common)
+target_include_directories(hrc_v3 PRIVATE ../../src/common)
+
+target_include_directories(uecc PRIVATE ../../include/common/ecc/micro-ecc)
 
 # Specify libraries to link with
 if(MSVC)
@@ -46,3 +66,6 @@ endif()
 
 target_link_libraries(hrc_v2 PRIVATE ${Boost_LIBRARIES})
 target_link_libraries(hrc_v3 PRIVATE ${Boost_LIBRARIES})
+
+target_link_libraries(hrc_v2 PRIVATE uecc)
+target_link_libraries(hrc_v3 PRIVATE uecc)
